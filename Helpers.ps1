@@ -1,0 +1,348 @@
+param(
+    [Parameter(Position = 0, Mandatory = $true)]
+    [Alias("n")]
+    [string]$scriptName,
+    [Alias("t")]
+    [Parameter(Position = 1, Mandatory = $false)]
+    [int]$terminate
+)
+$path = (Split-Path $MyInvocation.MyCommand.Path -Parent)
+Set-Location $path
+$script:attempt = 0
+function OnStreamEndAsJob() {
+    return Start-Job -Name "$scriptName-OnStreamEnd" -ScriptBlock {
+        param($path, $scriptName, $arguments)
+
+        function Write-Debug($message){
+            if ($arguments['debug']) {
+                Write-Host "DEBUG: $message"
+            }
+        }
+
+        Write-Host $arguments
+        
+        Write-Debug "Setting location to $path"
+        Set-Location $path
+        Write-Debug "Loading Helpers.ps1 with script name $scriptName"
+        . .\Helpers.ps1 -n $scriptName
+        Write-Debug "Loading Events.ps1 with script name $scriptName"
+        . .\Events.ps1 -n $scriptName
+        
+        Write-Host "Stream has ended, now invoking code"
+        Write-Debug "Creating pipe with name $scriptName-OnStreamEnd"
+        $job = Create-Pipe -pipeName "$scriptName-OnStreamEnd" 
+
+        while ($true) {
+            $maxTries = 25
+            $tries = 0
+
+            Write-Debug "Checking job state: $($job.State)"
+            if ($job.State -eq "Completed") {
+                Write-Host "Another instance of $scriptName has been started again. This current session is now redundant and will terminate without further action."
+                Write-Debug "Job state is 'Completed'. Exiting loop."
+                break;
+            }
+
+            Write-Debug "Invoking OnStreamEnd with arguments: $arguments"
+            if ((OnStreamEnd $arguments)) {
+                Write-Debug "OnStreamEnd returned true. Exiting loop."
+                break;
+            }
+
+        
+            if ((IsCurrentlyStreaming)) {
+                Write-Host "Streaming is active. To prevent potential conflicts, this script will now terminate prematurely."
+            }
+        
+
+            while (($tries -lt $maxTries) -and ($job.State -ne "Completed")) {
+                Start-Sleep -Milliseconds 200
+                $tries++
+            }
+        }
+
+        Write-Debug "Sending 'Terminate' message to pipe $scriptName-OnStreamEnd"
+        Send-PipeMessage "$scriptName-OnStreamEnd" Terminate
+    } -ArgumentList $path, $scriptName, $script:arguments
+}
+
+
+function Get-SunshineLogPath() {
+    $configPath = $settings.sunshineConfigPath
+    if (-not $configPath) { return $null }
+    $logDir = Split-Path $configPath -Parent
+    return (Join-Path $logDir "sunshine.log")
+}
+
+function Get-LastClientResolution() {
+    $logPath = Get-SunshineLogPath
+    if (-not $logPath -or -not (Test-Path $logPath)) { return $null }
+    # Find the most recent CLIENT CONNECTED entry and get the resolution from nearby
+    $logLines = Get-Content -Tail 500 -Path $logPath -ErrorAction SilentlyContinue
+    $connectIndex = -1
+    for ($i = $logLines.Count - 1; $i -ge 0; $i--) {
+        if ($logLines[$i] -match "CLIENT CONNECTED") {
+            $connectIndex = $i
+            break
+        }
+    }
+    if ($connectIndex -eq -1) { return $null }
+    # Search nearby lines for resolution info (SUNSHINE_CLIENT_WIDTH or Desktop resolution)
+    for ($i = $connectIndex; $i -lt $logLines.Count -and $i -lt $connectIndex + 50; $i++) {
+        if ($logLines[$i] -match "Desktop resolution \[(\d+)x(\d+)\]") {
+            return @{ Width = [int]$matches[1]; Height = [int]$matches[2]; Refresh = 60 }
+        }
+    }
+    return $null
+}
+
+function IsCurrentlyStreaming() {
+    $sunshineProcess = Get-Process sunshine -ErrorAction SilentlyContinue
+
+    if ($null -eq $sunshineProcess) {
+        return $false
+    }
+
+    # Check Sunshine log for most recent CLIENT CONNECTED/DISCONNECTED event
+    $logPath = Get-SunshineLogPath
+    if ($logPath -and (Test-Path $logPath)) {
+        $logTail = Get-Content -Tail 500 -Path $logPath -ErrorAction SilentlyContinue
+        $lastConnect = ($logTail | Select-String "CLIENT CONNECTED" -CaseSensitive | Select-Object -Last 1).LineNumber
+        $lastDisconnect = ($logTail | Select-String "CLIENT DISCONNECTED" -CaseSensitive | Select-Object -Last 1).LineNumber
+        if ($lastConnect -gt $lastDisconnect) {
+            return $true
+        }
+        return $false
+    }
+
+    # Fallback: check for ESTABLISHED connections (not just listening sockets)
+    # Sunshine always has listening sockets open, so we need to filter for
+    # connections that have a remote address (actual client connections)
+    $endpoints = Get-NetUDPEndpoint -OwningProcess $sunshineProcess.Id -ErrorAction Ignore
+    if (-not $endpoints) {
+        return $false
+    }
+    $activeConnections = $endpoints | Where-Object {
+        $_.RemoteAddress -and
+        $_.RemoteAddress -ne "0.0.0.0" -and
+        $_.RemoteAddress -ne "::" -and
+        $_.State -eq "Established"
+    }
+    return ($activeConnections.Count -gt 0)
+}
+
+function Stop-Script() {
+    Send-PipeMessage -pipeName $scriptName Terminate
+}
+function Send-PipeMessage($pipeName, $message) {
+    Write-Debug "Attempting to send message to pipe: $pipeName"
+
+    $pipeExists = Get-ChildItem -Path "\\.\pipe\" | Where-Object { $_.Name -eq $pipeName }
+    Write-Debug "Pipe exists check: $($pipeExists.Length -gt 0)"
+    
+    if ($pipeExists.Length -gt 0) {
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream(".", $pipeName, [System.IO.Pipes.PipeDirection]::Out)
+        Write-Debug "Connecting to pipe: $pipeName"
+        
+        $pipe.Connect(3000)
+        $streamWriter = New-Object System.IO.StreamWriter($pipe)
+        Write-Debug "Sending message: $message"
+        
+        $streamWriter.WriteLine($message)
+        try {
+            $streamWriter.Flush()
+            $streamWriter.Dispose()
+            $pipe.Dispose()
+            Write-Debug "Message sent and resources disposed successfully."
+        }
+        catch {
+            Write-Debug "Error during disposal: $_"
+            # We don't care if the disposal fails, this is common with async pipes.
+            # Also, this powershell script will terminate anyway.
+        }
+    }
+    else {
+        Write-Debug "Pipe not found: $pipeName"
+    }
+}
+
+
+function Create-Pipe($pipeName) {
+    return Start-Job -Name "$pipeName-PipeJob" -ScriptBlock {
+        param($pipeName, $scriptName) 
+        Register-EngineEvent -SourceIdentifier $scriptName -Forward
+        
+        $pipe = New-Object System.IO.Pipes.NamedPipeServerStream($pipeName, [System.IO.Pipes.PipeDirection]::In, 10, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
+
+        $streamReader = New-Object System.IO.StreamReader($pipe)
+        Write-Host "Waiting for named pipe to recieve kill command"
+        $pipe.WaitForConnection()
+
+        $message = $streamReader.ReadLine()
+        if ($message) {
+            Write-Host "Terminating pipe..."
+            $pipe.Dispose()
+            $streamReader.Dispose()
+            New-Event -SourceIdentifier $scriptName -MessageData $message
+        }
+    } -ArgumentList $pipeName, $scriptName
+}
+
+function Remove-OldLogs {
+
+    # Get all log files in the directory
+    $logFiles = Get-ChildItem -Path './logs' -Filter "log_*.txt" -ErrorAction SilentlyContinue
+
+    # Sort the files by creation time, oldest first
+    $sortedFiles = $logFiles | Sort-Object -Property CreationTime -ErrorAction SilentlyContinue
+
+    if ($sortedFiles) {
+        # Calculate how many files to delete
+        $filesToDelete = $sortedFiles.Count - 10
+
+        # Check if there are more than 10 files
+        if ($filesToDelete -gt 0) {
+            # Delete the oldest files, keeping the latest 10
+            $sortedFiles[0..($filesToDelete - 1)] | Remove-Item -Force
+        } 
+    }
+}
+
+function Start-Logging {
+    # Get the current timestamp
+    $timeStamp = [int][double]::Parse((Get-Date -UFormat "%s"))
+    $logDirectory = "./logs"
+
+    # Define the path and filename for the log file
+    $logFileName = "log_$timeStamp.txt"
+    $logFilePath = Join-Path $logDirectory $logFileName
+
+    # Check if the log directory exists, and create it if it does not
+    if (-not (Test-Path $logDirectory)) {
+        New-Item -Path $logDirectory -ItemType Directory
+    }
+
+    # Start logging to the log file
+    Start-Transcript -Path $logFilePath
+}
+
+
+
+function Stop-Logging {
+    Stop-Transcript
+}
+
+
+function Get-Settings {
+    # Read the file content
+    $jsonContent = Get-Content -Path ".\settings.json" -Raw
+
+    # Remove single line comments
+    $jsonContent = $jsonContent -replace '//.*', ''
+
+    # Remove multi-line comments
+    $jsonContent = $jsonContent -replace '/\*[\s\S]*?\*/', ''
+
+    # Remove trailing commas from arrays and objects
+    $jsonContent = $jsonContent -replace ',\s*([\]}])', '$1'
+
+    try {
+        # Convert JSON content to PowerShell object
+        $jsonObject = $jsonContent | ConvertFrom-Json
+        return $jsonObject
+    }
+    catch {
+        Write-Error "Failed to parse JSON: $_"
+    }
+}
+
+function Update-JsonProperty {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$Property,
+        
+        [Parameter(Mandatory = $true)]
+        [object]$NewValue
+    )
+
+    # Read the file as a single string.
+    $content = Get-Content -Path $FilePath -Raw
+
+    # Remove comments (both // and /* */ style) and trailing commas
+    $strippedContent = $content -replace '//.*?(\r?\n|$)', '$1' # Remove single line comments
+    $strippedContent = $strippedContent -replace '/\*[\s\S]*?\*/', '' # Remove multi-line comments
+    $strippedContent = $strippedContent -replace ',(\s*[\]}])', '$1' # Remove trailing commas
+
+    # Format the new value properly
+    if ($NewValue -is [string]) {
+        # Convert the string to a JSON-compliant string.
+        $formattedValue = (ConvertTo-Json $NewValue -Compress)
+    } else {
+        $formattedValue = $NewValue.ToString().ToLower()
+    }
+
+    # Build a regex pattern for matching the property.
+    $escapedProperty = [regex]::Escape($Property)
+    $pattern = '"' + $escapedProperty + '"\s*:\s*[^,}\r\n]+'
+
+    # Check if the property exists in the stripped content
+    if ($strippedContent -match $pattern) {
+        # Property exists, just update its value in the original content
+        $replacement = '"' + $Property + '": ' + $formattedValue
+        $updatedContent = [regex]::Replace($content, $pattern, $replacement)
+    } else {
+        # Property doesn't exist, need to add it
+        # Find the last property in the JSON object
+        $lastPropPattern = ',?\s*"([^"]+)"\s*:\s*[^,}\r\n]+'
+
+        if ($content -match '}\s*$') {
+            # Find the last occurrence of a property
+            $lastMatch = [regex]::Matches($content, $lastPropPattern)[-1]
+            $lastPropIndex = $lastMatch.Index + $lastMatch.Length
+            
+            # Check if the last property ends with a comma
+            $endsWithComma = $content.Substring($lastPropIndex).TrimStart() -match '^\s*,'
+            
+            # Prepare the new property string
+            $newPropString = ""
+            if (!$endsWithComma) {
+                $newPropString += ","
+            }
+            $newPropString += "`n    `"$Property`": $formattedValue"
+            
+            # Insert the new property before the closing brace
+            $closingBraceIndex = $content.LastIndexOf('}')
+            $updatedContent = $content.Substring(0, $closingBraceIndex).TrimEnd() + 
+                              $newPropString + 
+                              "`n}" +
+                              $content.Substring($closingBraceIndex + 1)
+        } else {
+            Write-Error "Unable to find a proper location to insert the new property. JSON file may be malformed."
+            return
+        }
+    }
+
+    # Write the updated content back.
+    Set-Content -Path $FilePath -Value $updatedContent
+}
+
+
+
+function Wait-ForStreamEndJobToComplete() {
+    $job = OnStreamEndAsJob
+    while ($job.State -ne "Completed") {
+        $job | Receive-Job
+        Start-Sleep -Seconds 1
+    }
+    $job | Wait-Job | Receive-Job
+}
+
+
+if ($terminate -eq 1) {
+    Write-Host "Stopping Script"
+    Stop-Script | Out-Null
+}
