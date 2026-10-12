@@ -2,6 +2,8 @@
 
 This script changes your host resolution to match exactly with Moonlight's resolution. This is mostly used for users who have different aspect ratios between the client and host, or anyone who wishes to match the resolution while streaming.
 
+<img width="2816" height="1536" alt="Gemini_Generated_Image_y30t8sy30t8sy30t" src="https://github.com/user-attachments/assets/b1b70b4c-74de-4486-ab86-1b16b79d96a9" />
+
 ### Requirements
 
 - Host must be Windows.
